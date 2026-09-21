@@ -355,6 +355,12 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     // B registered
                     if !rp.id.is_empty() {
+                        if !crate::allowlist::is_allowed(&rp.id).await {
+                            // Not on the customer allowlist: drop silently (no reply)
+                            // so the stock client just stays "not ready" instead of
+                            // regenerating its ID as it would on UUID_MISMATCH.
+                            return Ok(());
+                        }
                         log::trace!("New peer registered: {:?} {:?}", &rp.id, &addr);
                         self.update_addr(rp.id, addr, socket).await?;
                         if self.inner.serial > rp.serial {
@@ -369,6 +375,10 @@ impl RendezvousServer {
                     }
                 }
                 Some(rendezvous_message::Union::RegisterPk(rk)) => {
+                    if !crate::allowlist::is_allowed(&rk.id).await {
+                        // Not on the allowlist: drop silently (see RegisterPeer above).
+                        return Ok(());
+                    }
                     if rk.uuid.is_empty() || rk.pk.is_empty() {
                         return Ok(());
                     }
@@ -523,6 +533,14 @@ impl RendezvousServer {
                     // there maybe several attempt, so sink can be none
                     if let Some(sink) = sink.take() {
                         self.tcp_punch.lock().await.insert(try_into_v4(addr), sink);
+                    }
+                    if !crate::allowlist::is_staff_ip(try_into_v4(addr).ip()) {
+                        log::warn!("Relay request from non-staff IP {} refused", addr);
+                        return true;
+                    }
+                    if !crate::allowlist::is_allowed(&rf.id).await {
+                        log::warn!("Relay request to non-allowed target {} refused", rf.id);
+                        return true;
                     }
                     if let Some(peer) = self.pm.get_in_memory(&rf.id).await {
                         let mut msg_out = RendezvousMessage::new();
@@ -708,6 +726,15 @@ impl RendezvousServer {
         ws: bool,
     ) -> ResultType<(RendezvousMessage, Option<SocketAddr>)> {
         let mut ph = ph;
+        if !crate::allowlist::is_staff_ip(try_into_v4(addr).ip()) {
+            log::warn!("Punch-hole from non-staff IP {} refused", addr);
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::LICENSE_MISMATCH.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
         if !key.is_empty() && ph.licence_key != key {
             log::warn!("Authentication failed from {} for peer {} - invalid key", addr, ph.id);
             let mut msg_out = RendezvousMessage::new();
@@ -718,6 +745,17 @@ impl RendezvousServer {
             return Ok((msg_out, None));
         }
         let id = ph.id;
+        if !crate::allowlist::is_allowed(&id).await {
+            // Target is not (or no longer) allowed — respond as non-existent. This
+            // also aborts a connection to a peer whose support expired while it was
+            // still registered in memory.
+            let mut msg_out = RendezvousMessage::new();
+            msg_out.set_punch_hole_response(PunchHoleResponse {
+                failure: punch_hole_response::Failure::ID_NOT_EXIST.into(),
+                ..Default::default()
+            });
+            return Ok((msg_out, None));
+        }
         // punch hole request from A, relay to B,
         // check if in same intranet first,
         // fetch local addrs if in same intranet.
@@ -1114,6 +1152,10 @@ impl RendezvousServer {
                         }
                     }
                 }
+            }
+            Some("allow-flush" | "af") => {
+                crate::allowlist::flush_cache().await;
+                res = "allowlist cache flushed\n".to_owned();
             }
             _ => {}
         }
