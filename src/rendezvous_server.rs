@@ -355,7 +355,10 @@ impl RendezvousServer {
                 Some(rendezvous_message::Union::RegisterPeer(rp)) => {
                     // B registered
                     if !rp.id.is_empty() {
-                        if !crate::allowlist::is_allowed(&rp.id).await {
+                        // "(:test_hbbs:)" is hbbs's own startup self-test peer; it must get
+                        // a reply or hbbs exits(1) on timeout (crash-looping the server).
+                        // Never allowlist-gate it.
+                        if rp.id != "(:test_hbbs:)" && !crate::allowlist::is_allowed(&rp.id).await {
                             // Not on the customer allowlist: drop silently (no reply)
                             // so the stock client just stays "not ready" instead of
                             // regenerating its ID as it would on UUID_MISMATCH.
